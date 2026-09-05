@@ -562,8 +562,15 @@ private final class SilentFrameDelegate: NSObject, AVCaptureVideoDataOutputSampl
             completion(.failure(CameraError.captureFailed))
             return
         }
-        let ciImage = CIImage(cvPixelBuffer: buffer)
-        guard let cgImage = context.createCGImage(ciImage, from: ciImage.extent) else {
+        var ciImage = CIImage(cvPixelBuffer: buffer)
+        if ciImage.extent.width > ciImage.extent.height {
+            ciImage = ciImage.oriented(.left)
+        }
+        let normalizedImage = ciImage.transformed(by: CGAffineTransform(
+            translationX: -ciImage.extent.minX,
+            y: -ciImage.extent.minY
+        ))
+        guard let cgImage = context.createCGImage(normalizedImage, from: normalizedImage.extent) else {
             completion(.failure(CameraError.captureFailed))
             return
         }
