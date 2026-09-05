@@ -135,6 +135,8 @@ enum CameraError: LocalizedError {
     @Published var isVideoReady = false
     @Published var waitingImage: UIImage?
     @Published var shutterFlashVisible = false
+    @Published var frontFlashVisible = false
+    @Published var flashEnabled = false
 
     private let sessionQueue = DispatchQueue(label: "com.donotbereal.camera.session", qos: .userInitiated)
     private let sampleQueue = DispatchQueue(label: "com.donotbereal.camera.samples", qos: .userInitiated)
@@ -154,7 +156,11 @@ enum CameraError: LocalizedError {
     private weak var frontPreviewLayer: AVCaptureVideoPreviewLayer?
     private var videoPreparationID = UUID()
     private var currentSide: CameraSide = .front
+    private var rearOneXZoom: CGFloat = 1
+    private var previousScreenBrightness: CGFloat?
     private(set) var zoomAtGestureStart: CGFloat = 1
+
+    var displayedZoomFactor: CGFloat { zoomFactor / rearOneXZoom }
 
     func prepare(for mode: CaptureMode, side: CameraSide) async {
         let preparationID = videoPreparationID
@@ -190,7 +196,7 @@ enum CameraError: LocalizedError {
                 }
                 if !self.photoSession.isRunning { self.photoSession.startRunning() }
                 let device = self.photoInput?.device
-                Task { @MainActor in self.updateZoomRange(device: device) }
+                Task { @MainActor in self.updateZoomRange(device: device, side: side) }
             } catch { Task { @MainActor in self.errorMessage = error.localizedDescription } }
         }
     }
@@ -214,7 +220,7 @@ enum CameraError: LocalizedError {
                             self.waitingImage = first.image
                             self.sessionQueue.async {
                                 do {
-                                    try self.configurePhotoSession(side: side.opposite)
+                                    try self.configurePhotoSession(side: side.opposite, useWidestZoom: true)
                                     Task { @MainActor in self.beginCountdown() }
                                     self.sessionQueue.asyncAfter(deadline: .now() + 2) {
                                         self.captureSilentFrame(side: side.opposite) { secondResult in
@@ -251,6 +257,12 @@ enum CameraError: LocalizedError {
         }
     }
     func finishZoomGesture() { zoomAtGestureStart = zoomFactor }
+
+    func toggleRearZoom() {
+        let isAtOneX = abs(displayedZoomFactor - 1) < 0.05
+        setZoom(isAtOneX ? minimumZoom : rearOneXZoom)
+        finishZoomGesture()
+    }
 
     func startRecording() {
         guard multiCamSupported, isVideoReady, !isRecording,
@@ -331,7 +343,7 @@ enum CameraError: LocalizedError {
         }
     }
 
-    private func configurePhotoSession(side: CameraSide) throws {
+    private func configurePhotoSession(side: CameraSide, useWidestZoom: Bool = false) throws {
         let device = try cameraDevice(for: side, multiCam: false)
         let input = try AVCaptureDeviceInput(device: device)
         photoSession.beginConfiguration(); defer { photoSession.commitConfiguration() }
@@ -357,30 +369,64 @@ enum CameraError: LocalizedError {
         if let connection = silentFrameOutput.connection(with: .video), connection.isVideoRotationAngleSupported(90) {
             connection.videoRotationAngle = 90
         }
-        photoInput = input; currentSide = side; setWidestZoom(on: device)
+        photoInput = input
+        currentSide = side
+        if useWidestZoom { setWidestZoom(on: device) }
+        else { setInitialPhotoZoom(on: device, side: side) }
     }
 
     private func capturePhoto(side: CameraSide, completion: @escaping (Result<CapturedPhoto, Error>) -> Void) {
-        let settings = AVCapturePhotoSettings(); settings.flashMode = .off
+        let settings = AVCapturePhotoSettings()
+        let useFrontScreenFlash = side == .front && flashEnabled
+        settings.flashMode = side == .back && flashEnabled && photoInput?.device.hasFlash == true ? .on : .off
         settings.photoQualityPrioritization = .speed
         let delegate = PhotoDelegate(side: side, willCapture: { [weak self] in
+            guard !useFrontScreenFlash else { return }
             Task { @MainActor in self?.showShutterFlash() }
         }) { [weak self] result in
+            if useFrontScreenFlash { Task { @MainActor in self?.endFrontFlash() } }
             completion(result)
             self?.photoDelegate = nil
         }
         photoDelegate = delegate
-        photoOutput.capturePhoto(with: settings, delegate: delegate)
+        if useFrontScreenFlash {
+            Task { @MainActor in
+                self.beginFrontFlash()
+                self.sessionQueue.asyncAfter(deadline: .now() + 0.22) {
+                    self.photoOutput.capturePhoto(with: settings, delegate: delegate)
+                }
+            }
+        } else {
+            photoOutput.capturePhoto(with: settings, delegate: delegate)
+        }
     }
 
     private func captureSilentFrame(side: CameraSide, completion: @escaping (Result<CapturedPhoto, Error>) -> Void) {
+        let useFrontScreenFlash = side == .front && flashEnabled
+        let useBackTorch = side == .back && flashEnabled && photoInput?.device.hasTorch == true
         let delegate = SilentFrameDelegate(side: side) { [weak self] result in
             self?.silentFrameOutput.setSampleBufferDelegate(nil, queue: nil)
             self?.silentFrameDelegate = nil
+            if useFrontScreenFlash { Task { @MainActor in self?.endFrontFlash() } }
+            if useBackTorch { self?.setTorch(enabled: false) }
             completion(result)
         }
         silentFrameDelegate = delegate
-        silentFrameOutput.setSampleBufferDelegate(delegate, queue: sampleQueue)
+        let beginCapturingFrame = { [weak self] in
+            guard let self else { return }
+            self.silentFrameOutput.setSampleBufferDelegate(delegate, queue: self.sampleQueue)
+        }
+        if useFrontScreenFlash {
+            Task { @MainActor in
+                self.beginFrontFlash()
+                self.sessionQueue.asyncAfter(deadline: .now() + 0.22, execute: beginCapturingFrame)
+            }
+        } else if useBackTorch {
+            setTorch(enabled: true)
+            sessionQueue.asyncAfter(deadline: .now() + 0.18, execute: beginCapturingFrame)
+        } else {
+            beginCapturingFrame()
+        }
     }
 
     private func showShutterFlash() {
@@ -388,6 +434,33 @@ enum CameraError: LocalizedError {
         DispatchQueue.main.asyncAfter(deadline: .now() + 0.13) { [weak self] in
             self?.shutterFlashVisible = false
         }
+    }
+
+    private func beginFrontFlash() {
+        previousScreenBrightness = UIScreen.main.brightness
+        UIScreen.main.brightness = 1
+        frontFlashVisible = true
+    }
+
+    private func endFrontFlash() {
+        frontFlashVisible = false
+        if let previousScreenBrightness {
+            UIScreen.main.brightness = previousScreenBrightness
+            self.previousScreenBrightness = nil
+        }
+    }
+
+    private func setTorch(enabled: Bool) {
+        guard let device = photoInput?.device, device.hasTorch else { return }
+        do {
+            try device.lockForConfiguration()
+            if enabled {
+                try device.setTorchModeOn(level: AVCaptureDevice.maxAvailableTorchLevel)
+            } else {
+                device.torchMode = .off
+            }
+            device.unlockForConfiguration()
+        } catch {}
     }
 
     private func configureMultiCam(preparationID: UUID) {
@@ -502,10 +575,26 @@ enum CameraError: LocalizedError {
         catch {}
     }
 
-    private func updateZoomRange(device: AVCaptureDevice?) {
+    private func setInitialPhotoZoom(on device: AVCaptureDevice, side: CameraSide) {
+        let oneX = side == .back
+            ? device.virtualDeviceSwitchOverVideoZoomFactors.first.map { CGFloat(truncating: $0) } ?? 1
+            : device.minAvailableVideoZoomFactor
+        do {
+            try device.lockForConfiguration()
+            device.videoZoomFactor = min(max(oneX, device.minAvailableVideoZoomFactor), device.maxAvailableVideoZoomFactor)
+            device.unlockForConfiguration()
+        } catch {}
+    }
+
+    private func updateZoomRange(device: AVCaptureDevice?, side: CameraSide) {
         guard let device else { return }
-        minimumZoom = device.minAvailableVideoZoomFactor; maximumZoom = min(device.maxAvailableVideoZoomFactor, 5)
-        zoomFactor = minimumZoom; zoomAtGestureStart = minimumZoom
+        rearOneXZoom = side == .back
+            ? device.virtualDeviceSwitchOverVideoZoomFactors.first.map { CGFloat(truncating: $0) } ?? 1
+            : 1
+        minimumZoom = device.minAvailableVideoZoomFactor
+        maximumZoom = min(device.maxAvailableVideoZoomFactor, rearOneXZoom * 5)
+        zoomFactor = min(max(side == .back ? rearOneXZoom : minimumZoom, minimumZoom), maximumZoom)
+        zoomAtGestureStart = zoomFactor
     }
 
     private func beginCountdown() {

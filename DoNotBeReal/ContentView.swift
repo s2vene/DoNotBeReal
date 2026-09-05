@@ -6,6 +6,11 @@ struct ContentView: View {
     @State private var mode: CaptureMode = .photo
     @State private var firstCamera: CameraSide = .front
     @State private var result: CaptureResult?
+    private let isPreview: Bool
+
+    init(isPreview: Bool = false) {
+        self.isPreview = isPreview
+    }
 
     var body: some View {
         ZStack {
@@ -13,18 +18,25 @@ struct ContentView: View {
             VStack(spacing: 0) {
                 header
                 Group {
-                    if mode == .video { MultiCameraPreview(controller: camera) }
+                    if isPreview { CameraPreviewPlaceholder() }
+                    else if mode == .video { MultiCameraPreview(controller: camera) }
                     else { CameraPreview(session: camera.photoSession) }
                 }
                 .aspectRatio(3 / 4, contentMode: .fit)
-                .clipShape(RoundedRectangle(cornerRadius: 24, style: .continuous))
                 .overlay(alignment: .top) { statusOverlay }
                 .overlay { waitingOverlay }
+                .overlay {
+                    if camera.frontFlashVisible, mode == .photo {
+                        Color.white.allowsHitTesting(false)
+                    }
+                }
                 .overlay {
                     if camera.shutterFlashVisible, mode == .photo {
                         Color.black.opacity(0.62).allowsHitTesting(false)
                     }
                 }
+                .overlay(alignment: .bottom) { cameraControlsOverlay }
+                .clipShape(RoundedRectangle(cornerRadius: 24, style: .continuous))
                 .gesture(zoomGesture)
                 controls
             }
@@ -32,7 +44,10 @@ struct ContentView: View {
             .padding(.bottom, 12)
         }
         .preferredColorScheme(.dark)
-        .task { await camera.prepare(for: .photo, side: .front) }
+        .task {
+            guard !isPreview else { return }
+            await camera.prepare(for: .photo, side: .front)
+        }
         .onChange(of: mode) { _, value in camera.changeMode(to: value, side: firstCamera) }
         .onChange(of: firstCamera) { _, value in if mode == .photo { camera.selectCamera(value) } }
         .onReceive(camera.$result.compactMap { $0 }) { value in result = value; camera.result = nil }
@@ -45,21 +60,76 @@ struct ContentView: View {
     }
 
     private var header: some View {
-        VStack(spacing: 14) {
-            HStack {
-                Text("DoNotBeReal").font(.title2.bold())
-                Spacer()
-                if mode == .video, camera.isRecording {
-                    Label(camera.recordingTime.clockText, systemImage: "record.circle.fill")
-                        .font(.system(.body, design: .monospaced).weight(.semibold)).foregroundStyle(.red)
-                }
-            }
-            if mode == .photo {
-                Picker("먼저 촬영할 카메라", selection: $firstCamera) {
-                    ForEach(CameraSide.allCases) { Text("\($0.title) 먼저").tag($0) }
-                }.pickerStyle(.segmented)
+        HStack {
+            Text("BeFake.").font(.title2.bold())
+            Spacer()
+            if mode == .video, camera.isRecording {
+                Label(camera.recordingTime.clockText, systemImage: "record.circle.fill")
+                    .font(.system(.body, design: .monospaced).weight(.semibold)).foregroundStyle(.red)
             }
         }.padding(.vertical, 14)
+    }
+
+    private var cameraControlsOverlay: some View {
+        HStack(alignment: .center) {
+            flashButton
+            Spacer()
+            if mode == .photo, firstCamera == .back {
+                zoomButton
+            }
+            Spacer()
+            cameraSwitchButton
+        }
+        .padding(16)
+    }
+
+    private var flashButton: some View {
+        Button {
+            camera.flashEnabled.toggle()
+        } label: {
+            Image(systemName: camera.flashEnabled ? "bolt.fill" : "bolt.slash.fill")
+                .font(.system(size: 16, weight: .semibold))
+                .foregroundStyle(camera.flashEnabled ? .yellow : .white)
+                .frame(width: 40, height: 40)
+                .background(.black.opacity(0.5), in: Circle())
+        }
+        .buttonStyle(.plain)
+        .disabled(camera.isBusy || mode != .photo)
+        .opacity(camera.isBusy || mode != .photo ? 0.45 : 1)
+        .accessibilityLabel(camera.flashEnabled ? "플래시 끄기" : "플래시 켜기")
+    }
+
+    private var zoomButton: some View {
+        Button {
+            camera.toggleRearZoom()
+        } label: {
+            Text(camera.displayedZoomFactor.zoomText)
+                .font(.system(size: 12, weight: .semibold, design: .rounded))
+                .foregroundStyle(.white)
+                .monospacedDigit()
+                .frame(width: 40, height: 40)
+                .background(.black.opacity(0.5), in: Circle())
+        }
+        .buttonStyle(.plain)
+        .disabled(camera.isBusy)
+        .accessibilityLabel("현재 확대 배율 \(camera.displayedZoomFactor.zoomText)")
+        .accessibilityHint("두 번 탭하여 0.5배와 1배를 전환합니다")
+    }
+
+    private var cameraSwitchButton: some View {
+        Button {
+            firstCamera = firstCamera.opposite
+        } label: {
+            Image(systemName: "arrow.triangle.2.circlepath.camera.fill")
+                .font(.system(size: 16, weight: .semibold))
+                .foregroundStyle(.white)
+                .frame(width: 40, height: 40)
+                .background(.black.opacity(0.5), in: Circle())
+        }
+        .buttonStyle(.plain)
+        .disabled(camera.isBusy || mode != .photo)
+        .opacity(camera.isBusy || mode != .photo ? 0.45 : 1)
+        .accessibilityLabel("\(firstCamera.opposite.title) 카메라로 전환")
     }
 
     @ViewBuilder private var statusOverlay: some View {
@@ -86,7 +156,7 @@ struct ContentView: View {
                     ProgressView()
                         .tint(.white)
                         .scaleEffect(1.15)
-                    Text("대기중...")
+                    Text("스마일😄")
                         .font(.headline)
                         .foregroundStyle(.white)
                 }
@@ -97,14 +167,6 @@ struct ContentView: View {
 
     private var controls: some View {
         VStack(spacing: 12) {
-            if mode == .photo, firstCamera == .back {
-                HStack {
-                    Text(camera.minimumZoom.zoomText)
-                    Slider(value: Binding(get: { camera.zoomFactor }, set: { camera.setZoom($0) }),
-                           in: camera.minimumZoom...camera.maximumZoom)
-                    Text(camera.maximumZoom.zoomText)
-                }.font(.caption.monospacedDigit()).padding(.top, 12)
-            }
             Button {
                 if mode == .photo { camera.capturePair(startingWith: firstCamera) }
                 else if camera.isRecording { camera.stopRecording() }
@@ -121,8 +183,7 @@ struct ContentView: View {
             }
             .disabled(camera.isBusy || (mode == .video && (!camera.multiCamSupported || !camera.isVideoReady)))
             .opacity(camera.isBusy ? 0.5 : 1)
-            Text(mode == .photo ? "한 번 누르면 두 카메라가 차례로 촬영돼요" : "최대 1분 · 다시 누르면 종료")
-                .font(.caption).foregroundStyle(.secondary)
+            
         }.frame(maxWidth: .infinity).frame(minHeight: 128)
     }
 
@@ -132,6 +193,25 @@ struct ContentView: View {
                 if mode == .photo, firstCamera == .back { camera.setZoom(camera.zoomAtGestureStart * value.magnification) }
             }
             .onEnded { _ in camera.finishZoomGesture() }
+    }
+}
+
+private struct CameraPreviewPlaceholder: View {
+    var body: some View {
+        ZStack {
+            LinearGradient(
+                colors: [Color(red: 0.16, green: 0.18, blue: 0.22), Color(red: 0.04, green: 0.05, blue: 0.07)],
+                startPoint: .topLeading,
+                endPoint: .bottomTrailing
+            )
+            VStack(spacing: 12) {
+                Image(systemName: "camera.fill")
+                    .font(.system(size: 42, weight: .medium))
+                Text("카메라 미리보기")
+                    .font(.headline)
+            }
+            .foregroundStyle(.white.opacity(0.72))
+        }
     }
 }
 
@@ -268,4 +348,12 @@ private struct ShareSheet: UIViewControllerRepresentable {
 }
 
 private extension Double { var clockText: String { String(format: "%01d:%02d", Int(self) / 60, Int(self) % 60) } }
-private extension CGFloat { var zoomText: String { String(format: "%.1fx", self) } }
+private extension CGFloat {
+    var zoomText: String {
+        abs(self.rounded() - self) < 0.05 ? String(format: "%.0fx", self) : String(format: "%.1fx", self)
+    }
+}
+
+#Preview("촬영 화면") {
+    ContentView(isPreview: true)
+}
