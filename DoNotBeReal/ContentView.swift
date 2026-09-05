@@ -54,9 +54,6 @@ struct ContentView: View {
                         .font(.system(.body, design: .monospaced).weight(.semibold)).foregroundStyle(.red)
                 }
             }
-            Picker("촬영 모드", selection: $mode) {
-                ForEach(CaptureMode.allCases) { Label($0.title, systemImage: $0.icon).tag($0) }
-            }.pickerStyle(.segmented)
             if mode == .photo {
                 Picker("먼저 촬영할 카메라", selection: $firstCamera) {
                     ForEach(CameraSide.allCases) { Text("\($0.title) 먼저").tag($0) }

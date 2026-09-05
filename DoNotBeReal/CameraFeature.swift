@@ -150,22 +150,33 @@ enum CameraError: LocalizedError {
     private var backVideoOutput: AVCaptureVideoDataOutput?
     private var frontVideoOutput: AVCaptureVideoDataOutput?
     private var audioOutput: AVCaptureAudioDataOutput?
+    private weak var backPreviewLayer: AVCaptureVideoPreviewLayer?
+    private weak var frontPreviewLayer: AVCaptureVideoPreviewLayer?
+    private var videoPreparationID = UUID()
     private var currentSide: CameraSide = .front
     private(set) var zoomAtGestureStart: CGFloat = 1
 
     func prepare(for mode: CaptureMode, side: CameraSide) async {
+        let preparationID = videoPreparationID
         guard await requestAccess(for: .video) else { errorMessage = CameraError.cameraDenied.localizedDescription; return }
+        guard preparationID == videoPreparationID else { return }
         changeMode(to: mode, side: side)
     }
 
     func changeMode(to mode: CaptureMode, side: CameraSide) {
         stopSessions()
         isVideoReady = false
+        videoPreparationID = UUID()
         if mode == .photo { selectCamera(side) }
         else {
+            let preparationID = videoPreparationID
+            DispatchQueue.main.asyncAfter(deadline: .now() + 10) { [weak self] in
+                guard let self, self.videoPreparationID == preparationID, !self.isVideoReady else { return }
+                self.errorMessage = "동영상 카메라 준비 시간이 초과되었습니다. 사진 모드로 전환했다가 다시 시도해 주세요."
+            }
             Task {
                 guard await requestAccess(for: .audio) else { errorMessage = CameraError.microphoneDenied.localizedDescription; return }
-                configureMultiCam()
+                configureMultiCam(preparationID: preparationID)
             }
         }
     }
@@ -278,21 +289,29 @@ enum CameraError: LocalizedError {
     }
 
     func attachPreviewLayers(back: AVCaptureVideoPreviewLayer, front: AVCaptureVideoPreviewLayer) {
-        sessionQueue.async { [weak self, weak back, weak front] in
-            guard let self, let back, let front,
-                  let backPort = self.backInput?.ports.first(where: { $0.mediaType == .video }),
-                  let frontPort = self.frontInput?.ports.first(where: { $0.mediaType == .video }) else { return }
-            self.multiSession.beginConfiguration()
-            defer { self.multiSession.commitConfiguration() }
-            if back.connection == nil {
-                let connection = AVCaptureConnection(inputPort: backPort, videoPreviewLayer: back)
-                if self.multiSession.canAddConnection(connection) { self.multiSession.addConnection(connection) }
-            }
-            if front.connection == nil {
-                let connection = AVCaptureConnection(inputPort: frontPort, videoPreviewLayer: front)
-                if connection.isVideoMirroringSupported { connection.isVideoMirrored = true }
-                if self.multiSession.canAddConnection(connection) { self.multiSession.addConnection(connection) }
-            }
+        backPreviewLayer = back
+        frontPreviewLayer = front
+        sessionQueue.async { [weak self] in
+            self?.connectPreviewLayersIfPossible()
+        }
+    }
+
+    private func connectPreviewLayersIfPossible() {
+        guard let back = backPreviewLayer, let front = frontPreviewLayer,
+              let backPort = backInput?.ports.first(where: { $0.mediaType == .video }),
+              let frontPort = frontInput?.ports.first(where: { $0.mediaType == .video }) else { return }
+        multiSession.beginConfiguration()
+        defer { multiSession.commitConfiguration() }
+        if back.connection == nil {
+            let connection = AVCaptureConnection(inputPort: backPort, videoPreviewLayer: back)
+            if connection.isVideoRotationAngleSupported(90) { connection.videoRotationAngle = 90 }
+            if multiSession.canAddConnection(connection) { multiSession.addConnection(connection) }
+        }
+        if front.connection == nil {
+            let connection = AVCaptureConnection(inputPort: frontPort, videoPreviewLayer: front)
+            if connection.isVideoRotationAngleSupported(90) { connection.videoRotationAngle = 90 }
+            if connection.isVideoMirroringSupported { connection.isVideoMirrored = true }
+            if multiSession.canAddConnection(connection) { multiSession.addConnection(connection) }
         }
     }
 
@@ -371,7 +390,7 @@ enum CameraError: LocalizedError {
         }
     }
 
-    private func configureMultiCam() {
+    private func configureMultiCam(preparationID: UUID) {
         guard AVCaptureMultiCamSession.isMultiCamSupported else {
             multiCamSupported = false; errorMessage = CameraError.multiCamUnavailable.localizedDescription; return
         }
@@ -380,6 +399,8 @@ enum CameraError: LocalizedError {
             do {
                 let backDevice = try self.cameraDevice(for: .back, multiCam: true)
                 let frontDevice = try self.cameraDevice(for: .front, multiCam: true)
+                try self.configureMultiCamFormat(for: backDevice)
+                try self.configureMultiCamFormat(for: frontDevice)
                 let backInput = try AVCaptureDeviceInput(device: backDevice)
                 let frontInput = try AVCaptureDeviceInput(device: frontDevice)
                 let backOutput = AVCaptureVideoDataOutput(), frontOutput = AVCaptureVideoDataOutput()
@@ -426,15 +447,49 @@ enum CameraError: LocalizedError {
                 self.setWidestZoom(on: backDevice); self.setWidestZoom(on: frontDevice)
                 self.backInput = backInput; self.frontInput = frontInput
                 self.backVideoOutput = backOutput; self.frontVideoOutput = frontOutput; self.audioOutput = audioOutput
+                self.connectPreviewLayersIfPossible()
                 self.multiSession.startRunning()
-                Task { @MainActor in self.isVideoReady = true }
-            } catch { Task { @MainActor in self.errorMessage = error.localizedDescription } }
+                guard self.multiSession.isRunning else { throw CameraError.configurationFailed }
+                Task { @MainActor in
+                    guard self.videoPreparationID == preparationID else { return }
+                    self.isVideoReady = true
+                }
+            } catch {
+                Task { @MainActor in
+                    self.isVideoReady = false
+                    self.errorMessage = error.localizedDescription
+                }
+            }
         }
+    }
+
+    private func configureMultiCamFormat(for device: AVCaptureDevice) throws {
+        let candidates = device.formats.compactMap { format -> (AVCaptureDevice.Format, Int32, Int32)? in
+            guard format.isMultiCamSupported else { return nil }
+            let dimensions = CMVideoFormatDescriptionGetDimensions(format.formatDescription)
+            guard format.videoSupportedFrameRateRanges.contains(where: { $0.minFrameRate <= 30 && $0.maxFrameRate >= 30 }) else {
+                return nil
+            }
+            return (format, dimensions.width, dimensions.height)
+        }
+        let preferred = candidates.min { lhs, rhs in
+            let targetArea: Int32 = 640 * 480
+            let lhsDistance = abs(lhs.1 * lhs.2 - targetArea)
+            let rhsDistance = abs(rhs.1 * rhs.2 - targetArea)
+            return lhsDistance < rhsDistance
+        }
+        guard let preferred else { throw CameraError.configurationFailed }
+        try device.lockForConfiguration()
+        device.activeFormat = preferred.0
+        device.activeVideoMinFrameDuration = CMTime(value: 1, timescale: 30)
+        device.activeVideoMaxFrameDuration = CMTime(value: 1, timescale: 30)
+        device.unlockForConfiguration()
     }
 
     private func cameraDevice(for side: CameraSide, multiCam: Bool) throws -> AVCaptureDevice {
         let types: [AVCaptureDevice.DeviceType]
-        if side == .front { types = [.builtInTrueDepthCamera, .builtInWideAngleCamera] }
+        if side == .front, multiCam { types = [.builtInWideAngleCamera] }
+        else if side == .front { types = [.builtInTrueDepthCamera, .builtInWideAngleCamera] }
         else if multiCam { types = [.builtInUltraWideCamera, .builtInWideAngleCamera] }
         else { types = [.builtInTripleCamera, .builtInDualWideCamera, .builtInUltraWideCamera, .builtInWideAngleCamera] }
         let devices = AVCaptureDevice.DiscoverySession(deviceTypes: types, mediaType: .video, position: side.position).devices
@@ -572,7 +627,8 @@ final class MultiPreviewUIView: UIView {
     required init?(coder: NSCoder) { fatalError() }
     override func layoutSubviews() {
         super.layoutSubviews(); backLayer.frame = bounds
-        frontLayer.frame = CGRect(x: bounds.maxX - 134, y: 14, width: 120, height: 160)
+        let pipWidth = bounds.width * 0.31
+        frontLayer.frame = CGRect(x: 14, y: 14, width: pipWidth, height: pipWidth * 4 / 3)
     }
 }
 
@@ -644,8 +700,16 @@ private final class MultiCamRecorder: NSObject, AVCaptureVideoDataOutputSampleBu
         guard CVPixelBufferPoolCreatePixelBuffer(nil, pool, &destination) == kCVReturnSuccess, let destination else { return }
         var composite = aspectFill(CIImage(cvPixelBuffer: source), in: CGRect(origin: .zero, size: outputSize))
         if let latestFront {
-            let rect = CGRect(x: 720, y: 56, width: 300, height: 400)
-            composite = aspectFill(latestFront, in: rect).composited(over: composite)
+            let margin: CGFloat = 38
+            let pipRect = CGRect(x: margin, y: outputSize.height - margin - 447, width: 335, height: 447)
+            let borderMask = roundedMask(in: pipRect, radius: 44)
+            let blackCard = CIImage(color: .black).cropped(to: pipRect)
+                .applyingFilter("CIBlendWithMask", parameters: [kCIInputBackgroundImageKey: composite, kCIInputMaskImageKey: borderMask])
+            let innerRect = pipRect.insetBy(dx: 9, dy: 9)
+            let innerMask = roundedMask(in: innerRect, radius: 35)
+            let frontImage = aspectFill(latestFront, in: innerRect)
+                .applyingFilter("CIBlendWithMask", parameters: [kCIInputBackgroundImageKey: blackCard, kCIInputMaskImageKey: innerMask])
+            composite = frontImage.composited(over: composite)
         }
         context.render(composite, to: destination, bounds: CGRect(origin: .zero, size: outputSize), colorSpace: CGColorSpaceCreateDeviceRGB())
         adaptor?.append(destination, withPresentationTime: time)
@@ -666,5 +730,13 @@ private final class MultiCamRecorder: NSObject, AVCaptureVideoDataOutputSampleBu
             translationX: target.minX + (target.width - scaled.extent.width) / 2,
             y: target.minY + (target.height - scaled.extent.height) / 2
         )).cropped(to: target)
+    }
+
+    private func roundedMask(in rect: CGRect, radius: CGFloat) -> CIImage {
+        CIFilter(name: "CIRoundedRectangleGenerator", parameters: [
+            "inputExtent": CIVector(cgRect: rect),
+            "inputRadius": radius,
+            "inputColor": CIColor.white
+        ])?.outputImage?.cropped(to: rect) ?? CIImage(color: .white).cropped(to: rect)
     }
 }
