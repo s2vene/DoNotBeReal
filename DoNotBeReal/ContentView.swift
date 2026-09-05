@@ -150,9 +150,9 @@ struct ContentView: View {
                     .frame(maxWidth: .infinity, maxHeight: .infinity)
                     .clipped()
 
-                Color.black.opacity(0.48)
+                Color.black.opacity(0.5)
 
-                VStack(spacing: 12) {
+                VStack(spacing: 14) {
                     ProgressView()
                         .tint(.white)
                         .scaleEffect(1.15)
