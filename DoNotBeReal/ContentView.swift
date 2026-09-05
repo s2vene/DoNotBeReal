@@ -19,6 +19,12 @@ struct ContentView: View {
                 .aspectRatio(3 / 4, contentMode: .fit)
                 .clipShape(RoundedRectangle(cornerRadius: 24, style: .continuous))
                 .overlay(alignment: .top) { statusOverlay }
+                .overlay { waitingOverlay }
+                .overlay {
+                    if camera.shutterFlashVisible, mode == .photo {
+                        Color.black.opacity(0.62).allowsHitTesting(false)
+                    }
+                }
                 .gesture(zoomGesture)
                 controls
             }
@@ -68,6 +74,30 @@ struct ContentView: View {
         }
     }
 
+    @ViewBuilder private var waitingOverlay: some View {
+        if let image = camera.waitingImage, mode == .photo {
+            ZStack {
+                Image(uiImage: image)
+                    .resizable()
+                    .scaledToFill()
+                    .frame(maxWidth: .infinity, maxHeight: .infinity)
+                    .clipped()
+
+                Color.black.opacity(0.48)
+
+                VStack(spacing: 12) {
+                    ProgressView()
+                        .tint(.white)
+                        .scaleEffect(1.15)
+                    Text("대기중...")
+                        .font(.headline)
+                        .foregroundStyle(.white)
+                }
+            }
+            .allowsHitTesting(false)
+        }
+    }
+
     private var controls: some View {
         VStack(spacing: 12) {
             if mode == .photo, firstCamera == .back {
@@ -113,6 +143,8 @@ private struct ResultView: View {
     @Environment(\.dismiss) private var dismiss
     @State private var showShare = false
     @State private var message: String?
+    @State private var primaryIndex = 0
+    @State private var pipCorner: PiPCorner = .topLeading
 
     var body: some View {
         NavigationStack {
@@ -120,7 +152,8 @@ private struct ResultView: View {
                 Color.black.ignoresSafeArea()
                 Group {
                     switch result.kind {
-                    case .photos(let photos): PhotoPairView(photos: photos)
+                    case .photos(let photos):
+                        PhotoPairView(photos: photos, primaryIndex: $primaryIndex, pipCorner: $pipCorner)
                     case .video(let url): VideoPlayer(player: AVPlayer(url: url)).aspectRatio(3 / 4, contentMode: .fit)
                     }
                 }
@@ -136,7 +169,9 @@ private struct ResultView: View {
                     Button { showShare = true } label: { Image(systemName: "square.and.arrow.up") }
                 }
             }
-            .sheet(isPresented: $showShare) { ShareSheet(items: result.shareItems) }
+            .sheet(isPresented: $showShare) {
+                ShareSheet(items: result.shareItems(primaryIndex: primaryIndex, corner: pipCorner))
+            }
             .alert("알림", isPresented: Binding(get: { message != nil }, set: { if !$0 { message = nil } })) {
                 Button("확인", role: .cancel) {}
             } message: { Text(message ?? "") }
@@ -145,7 +180,10 @@ private struct ResultView: View {
 
     private func save() {
         Task {
-            do { try await result.saveToPhotoLibrary(); message = "사진 앱에 저장했습니다." }
+            do {
+                try await result.saveToPhotoLibrary(primaryIndex: primaryIndex, corner: pipCorner)
+                message = "사진 앱에 저장했습니다."
+            }
             catch { message = error.localizedDescription }
         }
     }
@@ -153,7 +191,9 @@ private struct ResultView: View {
 
 private struct PhotoPairView: View {
     let photos: [CapturedPhoto]
-    @State private var primaryIndex = 0
+    @Binding var primaryIndex: Int
+    @Binding var pipCorner: PiPCorner
+    @GestureState private var dragOffset: CGSize = .zero
 
     var body: some View {
         GeometryReader { geometry in
@@ -168,31 +208,57 @@ private struct PhotoPairView: View {
 
                 if photos.count > 1 {
                     let secondaryIndex = primaryIndex == 0 ? 1 : 0
-                    Button {
-                        withAnimation(.easeInOut(duration: 0.2)) {
-                            primaryIndex = secondaryIndex
+                    let pipWidth = geometry.size.width * 0.31
+                    let pipSize = CGSize(width: pipWidth, height: pipWidth * 4 / 3)
+                    let origin = pipOrigin(container: geometry.size, pip: pipSize)
+                    Image(uiImage: photos[secondaryIndex].image)
+                        .resizable()
+                        .scaledToFill()
+                        .frame(width: pipSize.width, height: pipSize.height)
+                        .clipped()
+                        .clipShape(RoundedRectangle(cornerRadius: 16, style: .continuous))
+                        .overlay {
+                            RoundedRectangle(cornerRadius: 16, style: .continuous)
+                                .stroke(.black, lineWidth: 3)
                         }
-                    } label: {
-                        Image(uiImage: photos[secondaryIndex].image)
-                            .resizable()
-                            .scaledToFill()
-                            .frame(
-                                width: geometry.size.width * 0.31,
-                                height: geometry.size.width * 0.31 * 4 / 3
-                            )
-                            .clipped()
-                            .clipShape(RoundedRectangle(cornerRadius: 16, style: .continuous))
-                            .overlay {
-                                RoundedRectangle(cornerRadius: 16, style: .continuous)
-                                    .stroke(.black, lineWidth: 3)
-                            }
-                    }
-                    .buttonStyle(.plain)
-                    .padding(14)
+                        .contentShape(Rectangle())
+                        .position(
+                            x: origin.x + pipSize.width / 2 + dragOffset.width,
+                            y: origin.y + pipSize.height / 2 + dragOffset.height
+                        )
+                        .onTapGesture { primaryIndex = secondaryIndex }
+                        .gesture(
+                            DragGesture(minimumDistance: 6)
+                                .updating($dragOffset) { value, state, _ in state = value.translation }
+                                .onEnded { value in
+                                    let center = CGPoint(
+                                        x: origin.x + pipSize.width / 2 + value.translation.width,
+                                        y: origin.y + pipSize.height / 2 + value.translation.height
+                                    )
+                                    let trailing = center.x >= geometry.size.width / 2
+                                    let bottom = center.y >= geometry.size.height / 2
+                                    withAnimation(.snappy(duration: 0.22)) {
+                                        pipCorner = switch (trailing, bottom) {
+                                        case (false, false): .topLeading
+                                        case (true, false): .topTrailing
+                                        case (false, true): .bottomLeading
+                                        case (true, true): .bottomTrailing
+                                        }
+                                    }
+                                }
+                        )
                 }
             }
         }
         .aspectRatio(3 / 4, contentMode: .fit)
+    }
+
+    private func pipOrigin(container: CGSize, pip: CGSize) -> CGPoint {
+        let margin: CGFloat = 14
+        return CGPoint(
+            x: pipCorner.isTrailing ? container.width - margin - pip.width : margin,
+            y: pipCorner.isBottom ? container.height - margin - pip.height : margin
+        )
     }
 }
 

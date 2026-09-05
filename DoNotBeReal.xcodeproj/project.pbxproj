@@ -212,6 +212,7 @@
 				DEVELOPMENT_TEAM = KF28DDXC26;
 				ENABLE_PREVIEWS = YES;
 				GENERATE_INFOPLIST_FILE = YES;
+				INFOPLIST_KEY_CFBundleDisplayName = BeFake.;
 				INFOPLIST_KEY_NSCameraUsageDescription = "전면 및 후면 카메라로 사진과 동영상을 촬영합니다.";
 				INFOPLIST_KEY_NSMicrophoneUsageDescription = "동영상에 소리를 녹음합니다.";
 				INFOPLIST_KEY_NSPhotoLibraryAddUsageDescription = "촬영한 사진과 동영상을 사진 앱에 저장합니다.";
@@ -245,6 +246,7 @@
 				DEVELOPMENT_TEAM = KF28DDXC26;
 				ENABLE_PREVIEWS = YES;
 				GENERATE_INFOPLIST_FILE = YES;
+				INFOPLIST_KEY_CFBundleDisplayName = BeFake.;
 				INFOPLIST_KEY_NSCameraUsageDescription = "전면 및 후면 카메라로 사진과 동영상을 촬영합니다.";
 				INFOPLIST_KEY_NSMicrophoneUsageDescription = "동영상에 소리를 녹음합니다.";
 				INFOPLIST_KEY_NSPhotoLibraryAddUsageDescription = "촬영한 사진과 동영상을 사진 앱에 저장합니다.";

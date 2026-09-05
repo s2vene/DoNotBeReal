@@ -24,27 +24,81 @@ struct CapturedPhoto {
     let image: UIImage
 }
 
+enum PiPCorner: CaseIterable {
+    case topLeading, topTrailing, bottomLeading, bottomTrailing
+
+    var isTrailing: Bool { self == .topTrailing || self == .bottomTrailing }
+    var isBottom: Bool { self == .bottomLeading || self == .bottomTrailing }
+}
+
 struct CaptureResult: Identifiable {
     enum Kind { case photos([CapturedPhoto]); case video(URL) }
     let id = UUID()
     let kind: Kind
 
-    var shareItems: [Any] {
+    func shareItems(primaryIndex: Int, corner: PiPCorner) -> [Any] {
         switch kind {
-        case .photos(let photos): photos.map(\.image)
+        case .photos(let photos): [PhotoCompositor.render(photos: photos, primaryIndex: primaryIndex, corner: corner)]
         case .video(let url): [url]
         }
     }
 
-    @MainActor func saveToPhotoLibrary() async throws {
+    @MainActor func saveToPhotoLibrary(primaryIndex: Int, corner: PiPCorner) async throws {
         let status = await PHPhotoLibrary.requestAuthorization(for: .addOnly)
         guard status == .authorized || status == .limited else { throw CameraError.photoLibraryDenied }
         try await PHPhotoLibrary.shared().performChanges {
             switch kind {
-            case .photos(let photos): photos.forEach { PHAssetChangeRequest.creationRequestForAsset(from: $0.image) }
+            case .photos(let photos):
+                let image = PhotoCompositor.render(photos: photos, primaryIndex: primaryIndex, corner: corner)
+                PHAssetChangeRequest.creationRequestForAsset(from: image)
             case .video(let url): PHAssetChangeRequest.creationRequestForAssetFromVideo(atFileURL: url)
             }
         }
+    }
+}
+
+private enum PhotoCompositor {
+    static func render(photos: [CapturedPhoto], primaryIndex: Int, corner: PiPCorner) -> UIImage {
+        guard !photos.isEmpty else { return UIImage() }
+        let canvasSize = CGSize(width: 1080, height: 1440)
+        let format = UIGraphicsImageRendererFormat()
+        format.scale = 1
+        format.opaque = true
+        return UIGraphicsImageRenderer(size: canvasSize, format: format).image { rendererContext in
+            UIColor.black.setFill()
+            rendererContext.fill(CGRect(origin: .zero, size: canvasSize))
+            let safePrimary = photos.indices.contains(primaryIndex) ? primaryIndex : 0
+            drawAspectFill(photos[safePrimary].image, in: CGRect(origin: .zero, size: canvasSize))
+
+            guard photos.count > 1 else { return }
+            let secondaryIndex = safePrimary == 0 ? 1 : 0
+            let margin: CGFloat = 38
+            let pipSize = CGSize(width: 335, height: 447)
+            let origin = CGPoint(
+                x: corner.isTrailing ? canvasSize.width - margin - pipSize.width : margin,
+                y: corner.isBottom ? canvasSize.height - margin - pipSize.height : margin
+            )
+            let pipRect = CGRect(origin: origin, size: pipSize)
+            let path = UIBezierPath(roundedRect: pipRect, cornerRadius: 44)
+            rendererContext.cgContext.saveGState()
+            path.addClip()
+            drawAspectFill(photos[secondaryIndex].image, in: pipRect)
+            rendererContext.cgContext.restoreGState()
+            UIColor.black.setStroke()
+            path.lineWidth = 9
+            path.stroke()
+        }
+    }
+
+    private static func drawAspectFill(_ image: UIImage, in rect: CGRect) {
+        let scale = max(rect.width / image.size.width, rect.height / image.size.height)
+        let size = CGSize(width: image.size.width * scale, height: image.size.height * scale)
+        image.draw(in: CGRect(
+            x: rect.midX - size.width / 2,
+            y: rect.midY - size.height / 2,
+            width: size.width,
+            height: size.height
+        ))
     }
 }
 
@@ -79,12 +133,16 @@ enum CameraError: LocalizedError {
     @Published var maximumZoom: CGFloat = 5
     @Published var multiCamSupported = AVCaptureMultiCamSession.isMultiCamSupported
     @Published var isVideoReady = false
+    @Published var waitingImage: UIImage?
+    @Published var shutterFlashVisible = false
 
     private let sessionQueue = DispatchQueue(label: "com.donotbereal.camera.session", qos: .userInitiated)
     private let sampleQueue = DispatchQueue(label: "com.donotbereal.camera.samples", qos: .userInitiated)
     private let photoOutput = AVCapturePhotoOutput()
+    private let silentFrameOutput = AVCaptureVideoDataOutput()
     private var photoInput: AVCaptureDeviceInput?
     private var photoDelegate: PhotoDelegate?
+    private var silentFrameDelegate: SilentFrameDelegate?
     private var timer: Timer?
     private var recorder: MultiCamRecorder?
     private var backInput: AVCaptureDeviceInput?
@@ -129,6 +187,7 @@ enum CameraError: LocalizedError {
     func capturePair(startingWith side: CameraSide) {
         guard !isBusy else { return }
         isBusy = true
+        waitingImage = nil
         sessionQueue.async { [weak self] in
             guard let self else { return }
             do {
@@ -140,24 +199,27 @@ enum CameraError: LocalizedError {
                     switch firstResult {
                     case .failure(let error): self.finishWithError(error)
                     case .success(let first):
-                        self.sessionQueue.async {
-                            do {
-                                try self.configurePhotoSession(side: side.opposite)
-                                Task { @MainActor in self.beginCountdown() }
-                                self.sessionQueue.asyncAfter(deadline: .now() + 2) {
-                                    self.capturePhoto(side: side.opposite) { secondResult in
-                                        switch secondResult {
-                                        case .failure(let error): self.finishWithError(error)
-                                        case .success(let second):
-                                            self.sessionQueue.async { try? self.configurePhotoSession(side: side) }
-                                            Task { @MainActor in
-                                                self.countdown = 0; self.isBusy = false
-                                                self.result = CaptureResult(kind: .photos([first, second]))
+                        Task { @MainActor in
+                            self.waitingImage = first.image
+                            self.sessionQueue.async {
+                                do {
+                                    try self.configurePhotoSession(side: side.opposite)
+                                    Task { @MainActor in self.beginCountdown() }
+                                    self.sessionQueue.asyncAfter(deadline: .now() + 2) {
+                                        self.captureSilentFrame(side: side.opposite) { secondResult in
+                                            switch secondResult {
+                                            case .failure(let error): self.finishWithError(error)
+                                            case .success(let second):
+                                                self.sessionQueue.async { try? self.configurePhotoSession(side: side) }
+                                                Task { @MainActor in
+                                                    self.countdown = 0; self.isBusy = false; self.waitingImage = nil
+                                                    self.result = CaptureResult(kind: .photos([first, second]))
+                                                }
                                             }
                                         }
                                     }
-                                }
-                            } catch { self.finishWithError(error) }
+                                } catch { self.finishWithError(error) }
+                            }
                         }
                     }
                 }
@@ -256,18 +318,57 @@ enum CameraError: LocalizedError {
         photoSession.beginConfiguration(); defer { photoSession.commitConfiguration() }
         photoSession.sessionPreset = .photo
         photoSession.inputs.forEach(photoSession.removeInput)
-        if photoSession.outputs.isEmpty, photoSession.canAddOutput(photoOutput) { photoSession.addOutput(photoOutput) }
-        photoOutput.maxPhotoQualityPrioritization = .quality
+        if !photoSession.outputs.contains(where: { $0 === photoOutput }), photoSession.canAddOutput(photoOutput) {
+            photoSession.addOutput(photoOutput)
+        }
+        if !photoSession.outputs.contains(where: { $0 === silentFrameOutput }), photoSession.canAddOutput(silentFrameOutput) {
+            silentFrameOutput.videoSettings = [kCVPixelBufferPixelFormatTypeKey as String: kCVPixelFormatType_32BGRA]
+            silentFrameOutput.alwaysDiscardsLateVideoFrames = true
+            photoSession.addOutput(silentFrameOutput)
+        }
+        photoOutput.maxPhotoQualityPrioritization = .speed
+        if photoOutput.isResponsiveCaptureSupported {
+            photoOutput.isResponsiveCaptureEnabled = true
+        }
+        if photoOutput.isFastCapturePrioritizationSupported {
+            photoOutput.isFastCapturePrioritizationEnabled = true
+        }
         guard photoSession.canAddInput(input) else { throw CameraError.configurationFailed }
-        photoSession.addInput(input); photoInput = input; currentSide = side; setWidestZoom(on: device)
+        photoSession.addInput(input)
+        if let connection = silentFrameOutput.connection(with: .video), connection.isVideoRotationAngleSupported(90) {
+            connection.videoRotationAngle = 90
+        }
+        photoInput = input; currentSide = side; setWidestZoom(on: device)
     }
 
     private func capturePhoto(side: CameraSide, completion: @escaping (Result<CapturedPhoto, Error>) -> Void) {
         let settings = AVCapturePhotoSettings(); settings.flashMode = .off
-        settings.photoQualityPrioritization = .quality
-        let delegate = PhotoDelegate(side: side) { [weak self] result in completion(result); self?.photoDelegate = nil }
+        settings.photoQualityPrioritization = .speed
+        let delegate = PhotoDelegate(side: side, willCapture: { [weak self] in
+            Task { @MainActor in self?.showShutterFlash() }
+        }) { [weak self] result in
+            completion(result)
+            self?.photoDelegate = nil
+        }
         photoDelegate = delegate
         photoOutput.capturePhoto(with: settings, delegate: delegate)
+    }
+
+    private func captureSilentFrame(side: CameraSide, completion: @escaping (Result<CapturedPhoto, Error>) -> Void) {
+        let delegate = SilentFrameDelegate(side: side) { [weak self] result in
+            self?.silentFrameOutput.setSampleBufferDelegate(nil, queue: nil)
+            self?.silentFrameDelegate = nil
+            completion(result)
+        }
+        silentFrameDelegate = delegate
+        silentFrameOutput.setSampleBufferDelegate(delegate, queue: sampleQueue)
+    }
+
+    private func showShutterFlash() {
+        shutterFlashVisible = true
+        DispatchQueue.main.asyncAfter(deadline: .now() + 0.13) { [weak self] in
+            self?.shutterFlashVisible = false
+        }
     }
 
     private func configureMultiCam() {
@@ -358,27 +459,76 @@ enum CameraError: LocalizedError {
     }
 
     private nonisolated func finishWithError(_ error: Error) {
-        Task { @MainActor in self.countdown = 0; self.isBusy = false; self.errorMessage = error.localizedDescription }
+        Task { @MainActor in
+            self.countdown = 0
+            self.isBusy = false
+            self.waitingImage = nil
+            self.errorMessage = error.localizedDescription
+        }
     }
 }
 
 private final class PhotoDelegate: NSObject, AVCapturePhotoCaptureDelegate {
     let side: CameraSide
+    let willCapture: () -> Void
     let completion: (Result<CapturedPhoto, Error>) -> Void
-    init(side: CameraSide, completion: @escaping (Result<CapturedPhoto, Error>) -> Void) { self.side = side; self.completion = completion }
+    init(side: CameraSide, willCapture: @escaping () -> Void, completion: @escaping (Result<CapturedPhoto, Error>) -> Void) {
+        self.side = side
+        self.willCapture = willCapture
+        self.completion = completion
+    }
+    func photoOutput(_ output: AVCapturePhotoOutput, willCapturePhotoFor resolvedSettings: AVCaptureResolvedPhotoSettings) {
+        willCapture()
+    }
     func photoOutput(_ output: AVCapturePhotoOutput, didFinishProcessingPhoto photo: AVCapturePhoto, error: Error?) {
         if let error { completion(.failure(error)); return }
         guard let data = photo.fileDataRepresentation(), let image = UIImage(data: data) else {
             completion(.failure(CameraError.captureFailed)); return
         }
-        completion(.success(CapturedPhoto(side: side, image: side == .front ? image.mirroredHorizontally : image)))
+        completion(.success(CapturedPhoto(side: side, image: side == .front ? image.horizontallyMirroredUpright : image)))
+    }
+}
+
+private final class SilentFrameDelegate: NSObject, AVCaptureVideoDataOutputSampleBufferDelegate {
+    let side: CameraSide
+    let completion: (Result<CapturedPhoto, Error>) -> Void
+    private let context = CIContext(options: [.cacheIntermediates: false])
+    private var delivered = false
+
+    init(side: CameraSide, completion: @escaping (Result<CapturedPhoto, Error>) -> Void) {
+        self.side = side
+        self.completion = completion
+    }
+
+    func captureOutput(_ output: AVCaptureOutput, didOutput sampleBuffer: CMSampleBuffer, from connection: AVCaptureConnection) {
+        guard !delivered else { return }
+        delivered = true
+        guard let buffer = CMSampleBufferGetImageBuffer(sampleBuffer) else {
+            completion(.failure(CameraError.captureFailed))
+            return
+        }
+        let ciImage = CIImage(cvPixelBuffer: buffer)
+        guard let cgImage = context.createCGImage(ciImage, from: ciImage.extent) else {
+            completion(.failure(CameraError.captureFailed))
+            return
+        }
+        let image = UIImage(cgImage: cgImage, scale: 1, orientation: .up)
+        let finalImage = side == .front ? image.horizontallyMirroredUpright : image
+        completion(.success(CapturedPhoto(side: side, image: finalImage)))
     }
 }
 
 private extension UIImage {
-    var mirroredHorizontally: UIImage {
-        guard let cgImage else { return self }
-        return UIImage(cgImage: cgImage, scale: scale, orientation: .upMirrored)
+    var horizontallyMirroredUpright: UIImage {
+        let format = UIGraphicsImageRendererFormat()
+        format.scale = scale
+        format.opaque = true
+        return UIGraphicsImageRenderer(size: size, format: format).image { rendererContext in
+            let context = rendererContext.cgContext
+            context.translateBy(x: size.width, y: 0)
+            context.scaleBy(x: -1, y: 1)
+            draw(in: CGRect(origin: .zero, size: size))
+        }
     }
 }
 
